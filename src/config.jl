@@ -25,6 +25,7 @@
 # rotation keys of ~23 MiB each, i.e. ~3.7 GiB; the keywords above bring that to ~2.9 GiB.
 # See the `FHEParams` docstring in `benchmark_matmul.jl` for the full size formula.
 const DEFAULT_FHE_PARAMS = [
+    FHEParams(15, 2 << 10),
     FHEParams(10, OpenFHE.HEStd_128_classic),
 ]
 
