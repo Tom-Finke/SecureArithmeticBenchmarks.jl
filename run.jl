@@ -18,6 +18,11 @@ limit defaults to 60% of total system memory and can be set explicitly:
     OMP_NUM_THREADS=1 julia --project run.jl --max-memory 40%
     OMP_NUM_THREADS=1 julia --project run.jl --max-memory 0     # no limit
 
+A run that raises an exception instead - for instance a multiplicative depth too small for
+the matrix size - does not abort anything: it is printed as `✗ errored: <reason>`, written to
+the CSV as a row with `status = error`, and the remaining modes, sizes and parameter sets
+still run. The sweep's exit code is 1 if any configuration errored, was killed or failed.
+
 Which FHE parameters and matrix sizes are swept is defined in `src/config.jl`.
 
 Note: `--secure-arithmetic-path` calls `Pkg.develop()`, which on Julia 1.11+ writes a
@@ -78,7 +83,10 @@ if IS_CHILD
     results = run_benchmarks(config)
     CSV_PATH === nothing || SecureArithmeticBenchmarks.write_csv(results, CSV_PATH,
                                                                  quiet = true)
-    exit(0)
+    # The fragment is written either way; the exit code tells the parent whether to report
+    # this configuration as partial.
+    exit(any(r -> r.status === :error, results) ?
+         SecureArithmeticBenchmarks.PARTIAL_EXIT_CODE : 0)
 end
 
 println("SecureArithmetic Matrix Multiplication Benchmark")

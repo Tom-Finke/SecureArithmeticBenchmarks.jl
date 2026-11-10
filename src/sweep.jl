@@ -16,6 +16,11 @@ const RUN_SCRIPT = joinpath(PROJECT_DIR, "run.jl")
 # A child killed by the cgroup OOM killer either reports termsignal 9 or exits with 137.
 const SIGKILL_EXIT_CODE = 137
 
+# A child that ran to completion but had at least one errored run exits with this code. It
+# still wrote its CSV fragment, so its rows - including the errored ones - are kept and the
+# configuration is reported as partial rather than failed.
+const PARTIAL_EXIT_CODE = 3
+
 """
     mem_total_bytes() -> Int
 
@@ -131,6 +136,12 @@ process and return the configurations that did not complete, as
 [`default_memory_limit`](@ref); pass `0` to run without a limit. Each child prints its
 result rows as it goes. With `csv` given, the children's CSV fragments are merged into that
 path; a configuration that was killed contributes no rows.
+
+A run that throws is handled inside the child (see [`run_benchmarks`](@ref)): it becomes a
+row with `status = error`, its siblings still run, and the child exits with
+`PARTIAL_EXIT_CODE`. Such a configuration keeps its rows and is listed here as
+`"some runs errored"`, so the returned vector is non-empty and the process exit code of
+`run.jl` signals that the sweep was not clean.
 """
 function run_sweep(config::BenchmarkConfig = BenchmarkConfig();
                    csv::Union{Nothing, AbstractString} = nothing,
@@ -153,35 +164,41 @@ function run_sweep(config::BenchmarkConfig = BenchmarkConfig();
 
     fragment_dir = mktempdir()
     fragments = String[]
-    skipped = Tuple{String, String, String}[]
+    failed = Tuple{String, String, String}[]
+    partial = Tuple{String, String, String}[]
 
     for (i, p) in enumerate(config.fhe_params), (j, sz) in enumerate(config.matrix_sizes)
         fragment = joinpath(fragment_dir, "fragment_$(i)_$(j).csv")
         process = run(ignorestatus(child_command(p, sz, config.modes, config.warmup,
                                                  fragment, limit)))
 
-        if process.exitcode == 0 && isfile(fragment)
+        if process.exitcode in (0, PARTIAL_EXIT_CODE) && isfile(fragment)
             push!(fragments, fragment)
+            if process.exitcode == PARTIAL_EXIT_CODE
+                push!(partial, (p.label, size_label(sz), "some runs errored"))
+            end
         else
             killed = process.termsignal == 9 || process.exitcode == SIGKILL_EXIT_CODE
             reason = killed ? "over limit ($(format_alloc(limit)))" :
                               "failed (exit code $(process.exitcode))"
-            push!(skipped, (p.label, size_label(sz), reason))
+            push!(failed, (p.label, size_label(sz), reason))
             println("  ✗ $(p.label)  $(size_label(sz)): $reason")
         end
     end
 
     csv === nothing || merge_fragments(fragments, csv)
 
-    n_done = length(fragments)
-    if isempty(skipped)
-        println("\nAll $(n_done) configuration(s) completed.")
+    n_clean = length(fragments) - length(partial)
+    if isempty(failed) && isempty(partial)
+        println("\nAll $(n_clean) configuration(s) completed.")
     else
-        println("\n$(n_done) configuration(s) completed, $(length(skipped)) did not:")
-        for (label, size, reason) in skipped
+        println("\n$(n_clean) configuration(s) completed cleanly, " *
+                "$(length(partial)) with errored runs, " *
+                "$(length(failed)) did not complete:")
+        for (label, size, reason) in Iterators.flatten((partial, failed))
             println("  $(rpad(label, 16)) $(rpad(size, 18)) $reason")
         end
     end
 
-    skipped
+    vcat(partial, failed)
 end

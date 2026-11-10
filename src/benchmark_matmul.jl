@@ -201,6 +201,10 @@ struct BenchmarkResult
     fhe_label::String
     matrix_size::String
     mode::Symbol
+    # `:ok` for a run that completed, `:error` for one that threw. In the latter case `error`
+    # holds a one-line summary of the exception and every metric below is zero.
+    status::Symbol
+    error::String
     wall_time_s::Float64
     alloc_bytes::Int
     eval_add_count::Int
@@ -218,8 +222,45 @@ struct BenchmarkResult
     result_level::Int
 end
 
+"""
+    errored_result(label, sz, mode, msg) -> BenchmarkResult
+
+Placeholder for a run that threw. The metrics are zero rather than missing so that the CSV
+stays a plain numeric table; `result_level = -1` marks "no ciphertext was produced".
+"""
+errored_result(label::AbstractString, sz::MatrixSize, mode::Symbol, msg::AbstractString) =
+    BenchmarkResult(label, size_label(sz), mode, :error, msg,
+                    0.0, 0, 0, 0.0, 0, 0.0, 0, 0.0, 0, 0.0, 0, 0.0, 0, 0.0, -1)
+
+# Exceptions that must never be turned into an errored row: Ctrl-C has to abort the sweep,
+# and running out of memory or stack leaves the process in no state to continue - letting it
+# die hands the configuration to the memory-limit path in `sweep.jl`.
+is_fatal(exc) = exc isa InterruptException || exc isa OutOfMemoryError ||
+                exc isa StackOverflowError
+
+"""
+    error_summary(exc; limit = 110) -> String
+
+One-line, length-capped summary of an exception, for the result table and the CSV.
+
+Collapsing the message to a single line is required, not cosmetic: `merge_fragments` copies
+the children's CSV fragments line by line, so an embedded newline would corrupt the merged
+file. OpenFHE's C++ messages are additionally prefixed with their own source location
+(`.../src/pke/lib/ciphertext-impl.cpp:l.52:SetLevel(): ...`), which is dropped.
+"""
+function error_summary(exc; limit::Int = 110)
+    msg = try
+        sprint(showerror, exc)
+    catch
+        string(typeof(exc))
+    end
+    line = first(split(strip(msg), '\n'))
+    line = replace(line, r"^.*?\.(?:cpp|h|hpp):l\.[0-9]+:\s*" => "")
+    length(line) > limit ? first(line, limit - 1) * "…" : String(line)
+end
+
 function run_single(context, public_key, private_key, counters::OpCounters,
-                    sz::MatrixSize, mode::Symbol)
+                    fhe_label::AbstractString, sz::MatrixSize, mode::Symbol)
     n, m, l = matrix_dims(sz)
     m1 = rand(n, m)
     m2 = rand(m, l)
@@ -251,9 +292,11 @@ function run_single(context, public_key, private_key, counters::OpCounters,
     result_level = SecureArithmetic.level(stats.value)
 
     BenchmarkResult(
-        "",
+        fhe_label,
         size_label(sz),
         mode,
+        :ok,
+        "",
         stats.time,
         stats.bytes,
         c.eval_add.count,    c.eval_add.time_s,
@@ -292,6 +335,13 @@ function print_header()
 end
 
 function print_result(r::BenchmarkResult)
+    # An errored run has no numbers to show: print the three identifying columns at their
+    # usual widths and the reason in place of the metrics.
+    if r.status === :error
+        @printf("%-10s  %-18s  %-16s  ✗ errored: %s\n",
+                r.fhe_label, r.matrix_size, r.mode, r.error)
+        return
+    end
     @printf("%-10s  %-18s  %-16s  %10.3f  %10s  %8d %10.3f  %8d %10.3f  %8d %10.3f  %8d %10.3f  %8d %10.3f  %8d %10.3f  %6d\n",
         r.fhe_label, r.matrix_size, r.mode, r.wall_time_s, format_alloc(r.alloc_bytes),
         r.eval_add_count, r.eval_add_time_s,
@@ -307,8 +357,11 @@ end
 # CSV output
 # ---------------------------------------------------------------------------
 
+# `status` is "ok" or "error"; `error` carries the message of an errored run and is empty
+# otherwise. Both were added after the first results were collected, so older CSV files have
+# two columns fewer.
 const CSV_HEADER = join([
-    "fhe_params", "matrix_size", "mode", "wall_time_s", "alloc_bytes",
+    "fhe_params", "matrix_size", "mode", "status", "error", "wall_time_s", "alloc_bytes",
     "eval_add_count", "eval_add_time_s",
     "eval_sub_count", "eval_sub_time_s",
     "eval_mult_count", "eval_mult_time_s",
@@ -318,12 +371,20 @@ const CSV_HEADER = join([
     "result_level",
 ], ",")
 
+# Only the error message can contain characters that would break the comma-separated
+# layout; every other field is numeric or a known-safe label.
+function csv_escape(s::AbstractString)
+    any(c -> c in (',', '"', '\n', '\r'), s) || return String(s)
+    '"' * replace(s, '"' => "\"\"") * '"'
+end
+
 function write_csv(results::Vector{BenchmarkResult}, path::String; quiet::Bool = false)
     open(path, "w") do io
         println(io, CSV_HEADER)
         for r in results
             println(io, join([
-                r.fhe_label, r.matrix_size, r.mode, r.wall_time_s, r.alloc_bytes,
+                r.fhe_label, r.matrix_size, r.mode, r.status, csv_escape(r.error),
+                r.wall_time_s, r.alloc_bytes,
                 r.eval_add_count, r.eval_add_time_s,
                 r.eval_sub_count, r.eval_sub_time_s,
                 r.eval_mult_count, r.eval_mult_time_s,
@@ -341,48 +402,92 @@ end
 # Main sweep
 # ---------------------------------------------------------------------------
 
+"""
+    run_benchmarks(config = BenchmarkConfig()) -> Vector{BenchmarkResult}
+
+Run every `(FHE params, matrix size, mode)` combination of `config` in this process.
+
+A run that throws is recorded as an errored result and the sweep continues, at the finest
+level that is still meaningful: a single mode, a matrix size whose rotation keys could not be
+generated (all its modes are marked errored), or a whole parameter set whose context setup
+failed (all its sizes and modes are marked errored). See [`is_fatal`](@ref) for the
+exceptions that are deliberately allowed to escape.
+"""
 function run_benchmarks(config::BenchmarkConfig = BenchmarkConfig())
     SecureArithmetic.disable_multithreading()
     results = BenchmarkResult[]
+    record!(r) = (push!(results, r); print_result(r))
 
     for p in config.fhe_params
         println("\n━━━ Setting up FHE context: $(p.label) " *
                 "(depth=$(p.multiplicative_depth), security=$(security_label(p.security_level))" *
                 (p.ring_dim > 0 ? ", ring_dim=$(p.ring_dim)" : "") * ") ━━━")
-        context, public_key, private_key, counters, ring_dim, batch_size = make_context(p)
-        init_multiplication!(context, private_key)
-        println("  ring dimension $(ring_dim), batch size $(batch_size), RSS $(rss_mib()) MiB")
-        
-        for sz in config.matrix_sizes
-            n, m, l = matrix_dims(sz)
-            SecureArithmetic.init_matrix_multiplication!(context, private_key, (n,m), (m,l))
-            n_elements = max(n * m, m * l)
-            ct_label = n_elements <= batch_size ? "single-CT" : "multi-CT"
-            println("  Matrix $(size_label(sz)) ($ct_label, $(n_elements) slots / batch " *
-                    "$(batch_size), RSS $(rss_mib()) MiB)")
 
-            for mode in config.modes
-                if config.warmup
-                    run_single(context, public_key, private_key, counters, sz, mode)
+        setup = nothing
+        try
+            setup = make_context(p)
+            init_multiplication!(setup[1], setup[3])  # context, private_key
+        catch exc
+            is_fatal(exc) && rethrow()
+            msg = error_summary(exc)
+            println("  ✗ context setup failed: $msg")
+            for sz in config.matrix_sizes, mode in config.modes
+                record!(errored_result(p.label, sz, mode, msg))
+            end
+            setup = nothing
+        end
+
+        if setup !== nothing
+            context, public_key, private_key, counters, ring_dim, batch_size = setup
+            println("  ring dimension $(ring_dim), batch size $(batch_size), RSS $(rss_mib()) MiB")
+
+            for sz in config.matrix_sizes
+                n, m, l = matrix_dims(sz)
+                try
+                    SecureArithmetic.init_matrix_multiplication!(context, private_key,
+                                                                 (n, m), (m, l))
+                catch exc
+                    is_fatal(exc) && rethrow()
+                    msg = error_summary(exc)
+                    println("  Matrix $(size_label(sz)): ✗ key generation failed: $msg")
+                    for mode in config.modes
+                        record!(errored_result(p.label, sz, mode, msg))
+                    end
+                    continue
                 end
 
-                r = run_single(context, public_key, private_key, counters, sz, mode)
-                r = BenchmarkResult(
-                    p.label, r.matrix_size, r.mode, r.wall_time_s, r.alloc_bytes,
-                    r.eval_add_count, r.eval_add_time_s,
-                    r.eval_sub_count, r.eval_sub_time_s,
-                    r.eval_mult_count, r.eval_mult_time_s,
-                    r.eval_rotate_count, r.eval_rotate_time_s,
-                    r.eval_negate_count, r.eval_negate_time_s,
-                    r.resize_count, r.resize_time_s,
-                    r.result_level,
-                )
-                push!(results, r)
-                print_result(r)
+                n_elements = max(n * m, m * l)
+                ct_label = n_elements <= batch_size ? "single-CT" : "multi-CT"
+                println("  Matrix $(size_label(sz)) ($ct_label, $(n_elements) slots / batch " *
+                        "$(batch_size), RSS $(rss_mib()) MiB)")
+
+                for mode in config.modes
+                    # `run_single` starts with `reset!(counters)`, so counters left dirty by a
+                    # run that threw do not leak into the next one.
+                    r = try
+                        if config.warmup
+                            run_single(context, public_key, private_key, counters,
+                                       p.label, sz, mode)
+                        end
+                        run_single(context, public_key, private_key, counters,
+                                   p.label, sz, mode)
+                    catch exc
+                        is_fatal(exc) && rethrow()
+                        errored_result(p.label, sz, mode, error_summary(exc))
+                    end
+                    record!(r)
+                end
             end
         end
 
-        SecureArithmetic.release_context_memory()
+        # Worth doing after a failed setup too: `make_context` may have gotten as far as
+        # putting keys into OpenFHE's static maps.
+        try
+            SecureArithmetic.release_context_memory()
+        catch exc
+            is_fatal(exc) && rethrow()
+            @warn "release_context_memory() failed" exception = exc
+        end
         GC.gc()
     end
 
