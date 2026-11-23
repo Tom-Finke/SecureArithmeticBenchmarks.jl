@@ -42,4 +42,5 @@ const DEFAULT_MATRIX_SIZES = MatrixSize[
     16, (16, 16, 1),
     32, (32,32,1)
     # 28, (28, 28, 1),
+    784, (784, 784,1),
 ]
