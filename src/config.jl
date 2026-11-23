@@ -37,10 +37,9 @@ const DEFAULT_FHE_PARAMS = [
 # operand must be square (`n == m`) and `l` must divide `m`. Rotation key count grows as
 # `3d - 2` shifts, so larger `d` costs proportionally more memory and key generation time.
 const DEFAULT_MATRIX_SIZES = MatrixSize[
-    4, (4, 4, 1),
-    8, (8, 8, 1),
     16, (16, 16, 1),
-    32, (32,32,1)
-    # 28, (28, 28, 1),
+    32, (32,32,1),
+    64, (64,64,1),
+    65, (65,65,1),
     784, (784, 784,1),
 ]
