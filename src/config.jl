@@ -26,7 +26,8 @@
 # See the `FHEParams` docstring in `benchmark_matmul.jl` for the full size formula.
 const DEFAULT_FHE_PARAMS = [
     FHEParams(5, 2 << 10),
-    FHEParams(5, OpenFHE.HEStd_128_classic),
+    FHEParams(8, 2 << 10),
+    FHEParams(8, OpenFHE.HEStd_128_classic),
 ]
 
 # ---------------------------------------------------------------------------
